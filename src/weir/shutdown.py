@@ -43,20 +43,40 @@ class ShutdownCoordinator:
     """
 
     def __init__(self, drain_timeout: float = 30.0) -> None:
+        """Initialize the shutdown coordinator.
+
+        Args:
+            drain_timeout: Maximum seconds to wait for pipeline drain before
+                force-cancelling workers.
+        """
         self._shutdown_event = asyncio.Event()
         self._completion_event = asyncio.Event()
+        self._force_event = asyncio.Event()
         self._drain_timeout = drain_timeout
         self._original_handlers: dict[signal.Signals, Any] = {}
 
     @property
     def should_stop(self) -> bool:
+        """Whether a shutdown has been requested."""
         return self._shutdown_event.is_set()
 
+    @property
+    def should_force(self) -> bool:
+        """Whether a force shutdown (second signal) has been requested."""
+        return self._force_event.is_set()
+
     def request_shutdown(self) -> None:
-        """Trigger shutdown. Idempotent."""
-        if not self._shutdown_event.is_set():
+        """Trigger shutdown. First call = graceful drain, second call = force-cancel."""
+        if self._shutdown_event.is_set():
+            logger.warning("Second signal received. Force-cancelling workers.")
+            self._force_event.set()
+        else:
             logger.info("Shutdown requested. Draining pipeline...")
             self._shutdown_event.set()
+
+    async def wait_for_force(self) -> None:
+        """Block until force shutdown is requested."""
+        await self._force_event.wait()
 
     def mark_complete(self) -> None:
         """Signal that the pipeline has fully drained."""
@@ -72,7 +92,8 @@ class ShutdownCoordinator:
         Returns True if drain completed, False if timed out.
         """
         try:
-            await asyncio.wait_for(self._completion_event.wait(), timeout=self._drain_timeout)
+            async with asyncio.timeout(self._drain_timeout):
+                await self._completion_event.wait()
             logger.info("Pipeline drained successfully.")
             return True
         except TimeoutError:

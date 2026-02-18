@@ -13,11 +13,10 @@ remaining items are flushed as a partial batch.
 import asyncio
 import functools
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any
 
 from .channel import Channel, _Sentinel
 from .errors import (
@@ -30,7 +29,7 @@ from .logging import get_logger
 from .metrics import StageMetrics
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BatchStageConfig:
     """Configuration for a batch stage."""
 
@@ -42,15 +41,26 @@ class BatchStageConfig:
     retry_base_delay: float = 0.1
     retry_max_delay: float = 30.0
     retryable_errors: tuple[type[Exception], ...] = (Exception,)
+    cpu_bound: bool = False
+    _retry_policy: RetryPolicy | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_retry_policy",
+            RetryPolicy(
+                max_attempts=self.retries,
+                base_delay=self.retry_base_delay,
+                max_delay=self.retry_max_delay,
+                retryable_errors=self.retryable_errors,
+            ),
+        )
 
     @property
     def retry_policy(self) -> RetryPolicy:
-        return RetryPolicy(
-            max_attempts=self.retries,
-            base_delay=self.retry_base_delay,
-            max_delay=self.retry_max_delay,
-            retryable_errors=self.retryable_errors,
-        )
+        """Return the cached RetryPolicy for this batch stage's retry configuration."""
+        assert self._retry_policy is not None
+        return self._retry_policy
 
 
 class BatchStageFunction:
@@ -62,18 +72,28 @@ class BatchStageFunction:
 
     def __init__(
         self,
-        func: Callable[..., Awaitable[Any]],
+        func: Callable[..., Any],
         config: BatchStageConfig,
     ) -> None:
+        """Initialize a batch stage function wrapper.
+
+        Args:
+            func: The function to wrap (async or sync for cpu_bound stages).
+            config: Batch stage configuration (batch_size, flush_timeout, etc.).
+        """
         self.func = func
         self.config = config
         self.name = func.__name__
         functools.update_wrapper(self, func)
 
     async def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Call the underlying function directly, bypassing framework machinery."""
+        if self.config.cpu_bound:
+            return self.func(*args, **kwargs)
         return await self.func(*args, **kwargs)
 
     def __repr__(self) -> str:
+        """Return a human-readable representation of the batch stage."""
         return (
             f"<BatchStage '{self.name}' batch_size={self.config.batch_size} "
             f"concurrency={self.config.concurrency}>"
@@ -89,8 +109,9 @@ def batch_stage(
     retry_base_delay: float = 0.1,
     retry_max_delay: float = 30.0,
     retryable_errors: tuple[type[Exception], ...] = (Exception,),
-) -> Callable[[Callable[..., Awaitable[Any]]], BatchStageFunction]:
-    """Decorator to declare an async function as a batch pipeline stage.
+    cpu_bound: bool = False,
+) -> Callable[[Callable[..., Any]], BatchStageFunction]:
+    """Decorator to declare a function as a batch pipeline stage.
 
     The decorated function receives a list of items and should process them
     as a batch. If the function returns a list, each element is pushed
@@ -105,6 +126,7 @@ def batch_stage(
         retry_base_delay: Base delay for exponential backoff.
         retry_max_delay: Maximum backoff delay.
         retryable_errors: Exception types that trigger retries.
+        cpu_bound: If True, offload to a ThreadPoolExecutor. Use with sync functions.
 
     Usage:
         @batch_stage(batch_size=50, flush_timeout=2.0)
@@ -112,7 +134,7 @@ def batch_stage(
             await db.insert_many(items)
     """
 
-    def decorator(func: Callable[..., Awaitable[Any]]) -> BatchStageFunction:
+    def decorator(func: Callable[..., Any]) -> BatchStageFunction:
         config = BatchStageConfig(
             batch_size=batch_size,
             flush_timeout=flush_timeout,
@@ -122,6 +144,7 @@ def batch_stage(
             retry_base_delay=retry_base_delay,
             retry_max_delay=retry_max_delay,
             retryable_errors=retryable_errors,
+            cpu_bound=cpu_bound,
         )
         return BatchStageFunction(func, config)
 
@@ -144,7 +167,18 @@ class BatchStageRunner:
         output_channel: Channel[Any] | None,
         error_router: ErrorRouter,
         pipeline_name: str,
+        hooks: list[Any] | None = None,
     ) -> None:
+        """Initialize a batch stage runner.
+
+        Args:
+            stage_func: The decorated batch stage function to execute.
+            input_channel: Channel to read items from.
+            output_channel: Channel to write results to, or None for terminal stages.
+            error_router: Router for handling permanently failed items.
+            pipeline_name: Name of the owning pipeline (for logging context).
+            hooks: Optional lifecycle hooks to invoke during processing.
+        """
         self.stage_func = stage_func
         self.input_channel = input_channel
         self.output_channel = output_channel
@@ -152,23 +186,51 @@ class BatchStageRunner:
         self.metrics = StageMetrics(stage_name=stage_func.name, _input_channel=input_channel)
         self.logger = get_logger(pipeline_name, stage_func.name)
         self._workers: list[asyncio.Task[None]] = []
+        self._executor: ThreadPoolExecutor | None = None
+        self._func: Callable[..., Any] = stage_func
+        self._record_retry = self.metrics.record_retry
+        # Pre-filter hooks by implemented methods
+        all_hooks = hooks or []
+        self._on_start_hooks = [h for h in all_hooks if hasattr(h, "on_start")]
+        self._on_item_hooks = [h for h in all_hooks if hasattr(h, "on_item")]
+        self._on_error_hooks = [h for h in all_hooks if hasattr(h, "on_error")]
+        self._on_complete_hooks = [h for h in all_hooks if hasattr(h, "on_complete")]
+        if stage_func.config.cpu_bound:
+            self._executor = ThreadPoolExecutor(
+                max_workers=stage_func.config.concurrency,
+                thread_name_prefix=f"{stage_func.name}-cpu",
+            )
 
     @property
     def name(self) -> str:
+        """The name of the underlying batch stage function."""
         return self.stage_func.name
 
     @property
     def config(self) -> BatchStageConfig:
+        """The batch stage's configuration (batch_size, flush_timeout, concurrency, etc.)."""
         return self.stage_func.config
 
     async def start(self) -> None:
         """Launch worker tasks."""
+        if self._executor is not None:
+            loop = asyncio.get_running_loop()
+            executor = self._executor
+            raw_func = self.stage_func.func
+
+            async def _offload(items: Any) -> Any:
+                return await loop.run_in_executor(executor, raw_func, items)
+
+            self._func = _offload
+
         self.logger.info(
             "Starting batch stage '%s' with %d workers (batch_size=%d)",
             self.name,
             self.config.concurrency,
             self.config.batch_size,
         )
+        for hook in self._on_start_hooks:
+            await hook.on_start(self.name)
         for i in range(self.config.concurrency):
             task = asyncio.create_task(
                 self._worker_loop(worker_id=i),
@@ -180,6 +242,17 @@ class BatchStageRunner:
         """Wait for all workers to complete."""
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
+        for hook in self._on_complete_hooks:
+            await hook.on_complete(self.name)
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+
+    async def cancel(self) -> None:
+        """Cancel all worker tasks and wait for them to finish."""
+        for task in self._workers:
+            if not task.done():
+                task.cancel()
+        await self.wait()
 
     async def _worker_loop(self, worker_id: int) -> None:
         """Main loop for a batch worker."""
@@ -197,7 +270,8 @@ class BatchStageRunner:
             # Try to get an item, with timeout if we have a partial batch
             try:
                 if remaining is not None:
-                    item = await asyncio.wait_for(self.input_channel.get(), timeout=remaining)
+                    async with asyncio.timeout(remaining):
+                        item = await self.input_channel.get()
                 else:
                     item = await self.input_channel.get()
             except TimeoutError:
@@ -233,18 +307,22 @@ class BatchStageRunner:
         t0 = time.monotonic()
         try:
             result = await execute_with_retry(
-                func=self.stage_func,
+                func=self._func,
                 item=batch,
                 stage_name=self.name,
                 policy=self.config.retry_policy,
-                on_retry=self.metrics.record_retry,
+                on_retry=self._record_retry,
                 timeout=self.config.timeout,
             )
             duration = time.monotonic() - t0
 
             # Record success for each item in the batch
+            per_item = duration / len(batch)
             for _ in batch:
-                await self.metrics.record_success(duration / len(batch))
+                self.metrics.record_success(per_item)
+
+            for hook in self._on_item_hooks:
+                await hook.on_item(self.name, batch, result, duration)
 
             # Push results downstream
             if self.output_channel is not None and result is not None:
@@ -259,8 +337,11 @@ class BatchStageRunner:
             raise
         except StageProcessingError as e:
             duration = time.monotonic() - t0
+            per_item = duration / len(batch)
             for _ in batch:
-                await self.metrics.record_error(duration / len(batch))
+                self.metrics.record_error(per_item)
+            for hook in self._on_error_hooks:
+                await hook.on_error(self.name, batch, e.error)
             try:
                 await self.error_router.handle(e.to_failed_item())
             except Exception as handler_err:

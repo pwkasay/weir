@@ -17,12 +17,12 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Self
 
 logger = logging.getLogger("weir.errors")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RetryPolicy:
     """Declarative retry configuration for a stage.
 
@@ -48,10 +48,11 @@ class RetryPolicy:
         return min(delay, self.max_delay)
 
     def is_retryable(self, error: Exception) -> bool:
+        """Check whether an error should trigger a retry based on its type."""
         return isinstance(error, self.retryable_errors)
 
 
-@dataclass
+@dataclass(slots=True)
 class FailedItem:
     """An item that has permanently failed processing.
 
@@ -67,6 +68,7 @@ class FailedItem:
     error_chain: list[Exception] = field(default_factory=list)
 
     def __repr__(self) -> str:
+        """Return a summary showing stage, error type, and attempt count."""
         return (
             f"<FailedItem stage='{self.stage_name}' "
             f"error={type(self.error).__name__} "
@@ -75,7 +77,7 @@ class FailedItem:
 
 
 # Type alias for error handlers
-ErrorHandler = Callable[[FailedItem], Awaitable[None]]
+type ErrorHandler = Callable[[FailedItem], Awaitable[None]]
 
 
 async def log_and_discard(failed: FailedItem) -> None:
@@ -96,11 +98,18 @@ class DeadLetterCollector:
     """
 
     def __init__(self, max_size: int = 10_000) -> None:
+        """Initialize the collector.
+
+        Args:
+            max_size: Maximum number of failed items to store. Overflow is counted
+                but discarded.
+        """
         self._items: list[FailedItem] = []
         self._max_size = max_size
         self._overflow_count = 0
 
     async def __call__(self, failed: FailedItem) -> None:
+        """Record a failed item. Discards if at capacity but tracks the overflow count."""
         if len(self._items) < self._max_size:
             self._items.append(failed)
         else:
@@ -113,18 +122,21 @@ class DeadLetterCollector:
 
     @property
     def items(self) -> list[FailedItem]:
+        """A copy of the collected failed items."""
         return list(self._items)
 
     @property
     def count(self) -> int:
+        """Total failures seen, including overflowed items that were discarded."""
         return len(self._items) + self._overflow_count
 
     def clear(self) -> None:
+        """Remove all collected items and reset the overflow counter."""
         self._items.clear()
         self._overflow_count = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class ErrorRouter:
     """Routes errors to handlers based on exception type.
 
@@ -142,12 +154,12 @@ class ErrorRouter:
     _routes: dict[type[Exception], ErrorHandler] = field(default_factory=dict)
     _default: ErrorHandler = field(default=log_and_discard)
 
-    def on(self, error_type: type[Exception], handler: ErrorHandler) -> ErrorRouter:
+    def on(self, error_type: type[Exception], handler: ErrorHandler) -> Self:
         """Register a handler for a specific exception type."""
         self._routes[error_type] = handler
         return self
 
-    def set_default(self, handler: ErrorHandler) -> ErrorRouter:
+    def set_default(self, handler: ErrorHandler) -> Self:
         """Set the default handler for unrouted errors."""
         self._default = handler
         return self
@@ -188,15 +200,36 @@ async def execute_with_retry(
     Timeout is applied per-attempt, not across the entire retry loop.
     TimeoutError is always treated as retryable.
     """
-    error_chain: list[Exception] = []
+    # Fast path: no retries configured (the common case)
+    if policy.max_attempts == 1:
+        try:
+            if timeout is not None:
+                async with asyncio.timeout(timeout):
+                    return await func(item)
+            else:
+                return await func(item)
+        except Exception as e:
+            raise StageProcessingError(
+                item=item,
+                stage_name=stage_name,
+                error=e,
+                attempts=1,
+                error_chain=[e],
+            ) from e
+
+    # Slow path: retry loop
+    error_chain: list[Exception] | None = None
 
     for attempt in range(policy.max_attempts):
         try:
             if timeout is not None:
-                return await asyncio.wait_for(func(item), timeout=timeout)
+                async with asyncio.timeout(timeout):
+                    return await func(item)
             else:
                 return await func(item)
         except TimeoutError as e:
+            if error_chain is None:
+                error_chain = []
             error_chain.append(e)
 
             is_last_attempt = attempt == policy.max_attempts - 1
@@ -222,6 +255,8 @@ async def execute_with_retry(
                 on_retry()
             await asyncio.sleep(delay)
         except Exception as e:
+            if error_chain is None:
+                error_chain = []
             error_chain.append(e)
 
             is_last_attempt = attempt == policy.max_attempts - 1
@@ -265,6 +300,15 @@ class StageProcessingError(Exception):
         attempts: int,
         error_chain: list[Exception],
     ) -> None:
+        """Initialize the processing error.
+
+        Args:
+            item: The item that failed processing.
+            stage_name: Name of the stage where failure occurred.
+            error: The final exception that caused the failure.
+            attempts: Total number of attempts made.
+            error_chain: All exceptions encountered across retry attempts.
+        """
         self.item = item
         self.stage_name = stage_name
         self.error = error
@@ -273,6 +317,7 @@ class StageProcessingError(Exception):
         super().__init__(f"Stage '{stage_name}' failed after {attempts} attempts: {error}")
 
     def to_failed_item(self) -> FailedItem:
+        """Convert this exception into a FailedItem for error routing."""
         return FailedItem(
             item=self.item,
             stage_name=self.stage_name,

@@ -13,16 +13,15 @@ without anyone thinking about it.
 import json
 import logging
 import sys
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from collections.abc import MutableMapping
+from collections.abc import MutableMapping
+from typing import Any
 
 
 class StructuredFormatter(logging.Formatter):
-    """JSON Lines formatter for production use."""
+    """JSON Lines log formatter for production environments."""
 
     def format(self, record: logging.LogRecord) -> str:
+        """Format a log record as a single JSON line."""
         log_entry: dict[str, Any] = {
             "ts": self.formatTime(record),
             "level": record.levelname.lower(),
@@ -48,7 +47,7 @@ class StructuredFormatter(logging.Formatter):
 
 
 class HumanFormatter(logging.Formatter):
-    """Readable formatter for development."""
+    """Colored, human-readable log formatter for development environments."""
 
     COLORS: dict[str, str] = {  # noqa: RUF012
         "DEBUG": "\033[36m",  # cyan
@@ -60,6 +59,7 @@ class HumanFormatter(logging.Formatter):
     RESET = "\033[0m"
 
     def format(self, record: logging.LogRecord) -> str:
+        """Format a log record with ANSI colors and pipeline/stage context."""
         color = self.COLORS.get(record.levelname, "")
         reset = self.RESET
 
@@ -87,11 +87,12 @@ class HumanFormatter(logging.Formatter):
 
 
 class PipelineLoggerAdapter(logging.LoggerAdapter[logging.Logger]):
-    """Logger adapter that injects pipeline and stage context."""
+    """Logger adapter that injects pipeline and stage names into every log record."""
 
     def process(
         self, msg: str, kwargs: MutableMapping[str, Any]
     ) -> tuple[str, MutableMapping[str, Any]]:
+        """Merge pipeline/stage context into the log record's extra dict."""
         extra = kwargs.get("extra", {})
         extra.update(self.extra)
         kwargs["extra"] = extra

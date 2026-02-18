@@ -26,36 +26,41 @@ you can inspect the built pipeline's topology without running it.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import AsyncIterable, Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
 
 from .batch import BatchStageFunction, BatchStageRunner
 from .channel import Channel
 from .errors import DeadLetterCollector, ErrorHandler, ErrorRouter
-from .logging import configure_logging, get_logger
+from .logging import PipelineLoggerAdapter, configure_logging, get_logger
+from .metrics import StageMetricsSnapshot
 from .shutdown import ShutdownCoordinator
 from .stage import StageFunction, StageRunner
 
 logger = logging.getLogger("weir.pipeline")
 
 # Sources can be sync iterables or async iterables
-SourceType = Iterable[Any] | AsyncIterable[Any] | Callable[[], Iterable[Any] | AsyncIterable[Any]]
+type SourceType = (
+    Iterable[Any] | AsyncIterable[Any] | Callable[[], Iterable[Any] | AsyncIterable[Any]]
+)
 
 
-@dataclass
+@dataclass(slots=True)
 class PipelineResult:
     """Summary of a pipeline run."""
 
     pipeline_name: str
     duration_seconds: float
-    stage_metrics: list[dict[str, Any]]
+    stage_metrics: list[StageMetricsSnapshot]
     completed: bool  # False if shutdown was forced / timed out
     dead_letters: int
 
     def __repr__(self) -> str:
+        """Return a compact summary showing status, duration, and stage count."""
         status = "completed" if self.completed else "interrupted"
         return (
             f"<PipelineResult '{self.pipeline_name}' {status} "
@@ -110,6 +115,15 @@ class Pipeline:
         log_level: int = logging.INFO,
         structured_logging: bool = False,
     ) -> None:
+        """Initialize a pipeline builder.
+
+        Args:
+            name: Human-readable name for logging and metrics.
+            channel_capacity: Bounded queue size between stages.
+            drain_timeout: Seconds to wait for graceful shutdown drain.
+            log_level: Python logging level for pipeline logs.
+            structured_logging: If True, emit JSON lines instead of human-readable logs.
+        """
         self._name = name
         self._channel_capacity = channel_capacity
         self._drain_timeout = drain_timeout
@@ -121,6 +135,9 @@ class Pipeline:
         self._stages: list[StageFunction | BatchStageFunction] = []
         self._error_router = ErrorRouter()
         self._dead_letters = DeadLetterCollector()
+        self._hooks: list[Any] = []
+        self._metrics_callback: Callable[..., Any] | None = None
+        self._metrics_interval: float = 5.0
         self._built = False
 
         # Runtime state (populated by build)
@@ -130,9 +147,10 @@ class Pipeline:
 
     @property
     def name(self) -> str:
+        """The pipeline's name."""
         return self._name
 
-    def source(self, src: SourceType) -> Pipeline:
+    def source(self, src: SourceType) -> Self:
         """Set the data source.
 
         Accepts:
@@ -145,7 +163,7 @@ class Pipeline:
         self._source = src
         return self
 
-    def then(self, stage_func: StageFunction | BatchStageFunction) -> Pipeline:
+    def then(self, stage_func: StageFunction | BatchStageFunction) -> Self:
         """Append a stage to the pipeline."""
         if self._built:
             raise RuntimeError("Cannot modify a built pipeline")
@@ -162,7 +180,7 @@ class Pipeline:
         self,
         error_type: type[Exception],
         handler: ErrorHandler | None = None,
-    ) -> Pipeline:
+    ) -> Self:
         """Register an error handler for a specific exception type.
 
         If no handler is provided, uses the built-in dead letter collector.
@@ -172,7 +190,38 @@ class Pipeline:
         self._error_router.on(error_type, handler or self._dead_letters)
         return self
 
-    def build(self) -> Pipeline:
+    def with_hook(self, hook: Any) -> Self:
+        """Register a lifecycle hook for all stages.
+
+        Hooks receive callbacks at stage lifecycle points (start, item, error, complete).
+        Only methods that exist on the hook object are called — implement only what you need.
+        """
+        if self._built:
+            raise RuntimeError("Cannot modify a built pipeline")
+        self._hooks.append(hook)
+        return self
+
+    def on_metrics(
+        self,
+        callback: Callable[..., Any],
+        interval: float = 5.0,
+    ) -> Self:
+        """Register a callback for periodic metrics snapshots during pipeline.run().
+
+        The callback receives a list of StageMetricsSnapshot dicts, one per stage.
+        Both sync and async callables are supported.
+
+        Args:
+            callback: Function called with [StageMetricsSnapshot, ...] each interval.
+            interval: Seconds between callback invocations.
+        """
+        if self._built:
+            raise RuntimeError("Cannot modify a built pipeline")
+        self._metrics_callback = callback
+        self._metrics_interval = interval
+        return self
+
+    def build(self) -> Self:
         """Finalize the pipeline topology. Must be called before run()."""
         if self._built:
             raise RuntimeError("Pipeline already built")
@@ -184,7 +233,30 @@ class Pipeline:
         # Set default error handler to dead letter collector
         self._error_router.set_default(self._dead_letters)
 
-        # Create channels between stages (n stages → n channels, including source→first)
+        self._wire_topology()
+        self._built = True
+        return self
+
+    def reset(self, new_source: SourceType | None = None) -> Self:
+        """Reset the pipeline for re-running with fresh state.
+
+        Rebuilds channels, runners, and coordinator. Clears dead letters.
+        Pipeline stays "built" and ready for another run().
+
+        Args:
+            new_source: Optional new data source. If None, reuses the original source.
+        """
+        if not self._built:
+            raise RuntimeError("Cannot reset a pipeline that hasn't been built yet.")
+        if new_source is not None:
+            self._source = new_source
+        self._dead_letters.clear()
+        self._wire_topology()
+        return self
+
+    def _wire_topology(self) -> None:
+        """Create channels and runners from the stage list. Used by build() and reset()."""
+        # Create channels between stages (n stages -> n channels, including source->first)
         self._channels = []
         for i in range(len(self._stages)):
             ch: Channel[Any] = Channel(
@@ -200,6 +272,7 @@ class Pipeline:
             # Output channel is the next stage's input, or None for the last stage
             output_ch = self._channels[i + 1] if i + 1 < len(self._channels) else None
 
+            hooks = self._hooks if self._hooks else None
             if isinstance(stage_func, BatchStageFunction):
                 runner: StageRunner | BatchStageRunner = BatchStageRunner(
                     stage_func=stage_func,
@@ -207,6 +280,7 @@ class Pipeline:
                     output_channel=output_ch,
                     error_router=self._error_router,
                     pipeline_name=self._name,
+                    hooks=hooks,
                 )
             else:
                 runner = StageRunner(
@@ -215,12 +289,11 @@ class Pipeline:
                     output_channel=output_ch,
                     error_router=self._error_router,
                     pipeline_name=self._name,
+                    hooks=hooks,
                 )
             self._runners.append(runner)
 
         self._coordinator = ShutdownCoordinator(drain_timeout=self._drain_timeout)
-        self._built = True
-        return self
 
     async def run(self) -> PipelineResult:
         """Run the pipeline to completion (or until interrupted).
@@ -242,33 +315,55 @@ class Pipeline:
         # Install signal handlers
         self._coordinator.install_signal_handlers()
 
+        metrics_task: asyncio.Task[None] | None = None
         try:
             # Start all stage workers
             for runner in self._runners:
                 await runner.start()
+
+            # Launch periodic metrics callback if configured
+            if self._metrics_callback is not None:
+                metrics_task = asyncio.create_task(
+                    self._metrics_loop(),
+                    name=f"{self._name}-metrics",
+                )
 
             # Feed source into first channel
             first_channel = self._channels[0]
             first_stage = self._runners[0]
             await self._feed_source(first_channel, first_stage.config.concurrency, log)
 
-            # Drain stages — apply timeout if shutdown was requested
-            if self._coordinator.should_stop:
-                try:
-                    await asyncio.wait_for(self._drain_stages(), timeout=self._drain_timeout)
-                except TimeoutError:
-                    log.warning(
-                        "Drain timed out after %.1fs, cancelling remaining workers",
-                        self._drain_timeout,
+            # Drain stages — race against force-kill and optional timeout
+            drain_task = asyncio.create_task(self._drain_stages())
+            force_task = asyncio.create_task(self._coordinator.wait_for_force())
+            timeout = self._drain_timeout if self._coordinator.should_stop else None
+            try:
+                async with asyncio.timeout(timeout):
+                    done, pending = await asyncio.wait(
+                        [drain_task, force_task],
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                    for runner in self._runners:
-                        for task in runner._workers:
-                            if not task.done():
-                                task.cancel()
-                    for runner in self._runners:
-                        await runner.wait()
-            else:
-                await self._drain_stages()
+                    for t in pending:
+                        t.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await t
+                    if force_task in done:
+                        log.warning("Force shutdown — cancelling all workers")
+                        for runner in self._runners:
+                            await runner.cancel()
+            except TimeoutError:
+                drain_task.cancel()
+                force_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await drain_task
+                with contextlib.suppress(asyncio.CancelledError):
+                    await force_task
+                log.warning(
+                    "Drain timed out after %.1fs, cancelling remaining workers",
+                    self._drain_timeout,
+                )
+                for runner in self._runners:
+                    await runner.cancel()
 
             completed = True
 
@@ -279,6 +374,10 @@ class Pipeline:
             log.error("Pipeline failed with unexpected error: %s", e, exc_info=True)
             completed = False
         finally:
+            if metrics_task is not None:
+                metrics_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await metrics_task
             self._coordinator.restore_signal_handlers()
 
         duration = time.monotonic() - t0
@@ -296,21 +395,32 @@ class Pipeline:
 
     async def _drain_stages(self) -> None:
         """Wait for all stages to drain sequentially, sending STOP sentinels downstream."""
-        for runner in self._runners:
+        for idx, runner in enumerate(self._runners):
             await runner.wait()
 
             # After this stage is done, send STOP to the next stage's workers
-            idx = self._runners.index(runner)
             if idx + 1 < len(self._runners):
                 next_runner = self._runners[idx + 1]
                 next_channel = self._channels[idx + 1]
                 await next_channel.send_stop(next_runner.config.concurrency)
 
+    async def _metrics_loop(self) -> None:
+        """Periodically snapshot metrics and invoke the callback."""
+        assert self._metrics_callback is not None
+        callback = self._metrics_callback
+        interval = self._metrics_interval
+        while True:
+            await asyncio.sleep(interval)
+            snapshots = [r.metrics.snapshot() for r in self._runners]
+            result = callback(snapshots)
+            if asyncio.iscoroutine(result):
+                await result
+
     async def _feed_source(
         self,
         channel: Channel[Any],
         num_consumers: int,
-        log: Any,
+        log: PipelineLoggerAdapter,
     ) -> None:
         """Feed items from the source into the first channel.
 
@@ -353,6 +463,7 @@ class Pipeline:
 
     @property
     def stage_names(self) -> list[str]:
+        """Ordered list of stage names in the pipeline."""
         return [s.name for s in self._stages]
 
     @property

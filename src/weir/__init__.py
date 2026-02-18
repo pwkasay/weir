@@ -17,8 +17,9 @@ from .errors import (
     RetryPolicy,
     StageProcessingError,
 )
+from .hooks import Hook
 from .logging import configure_logging
-from .metrics import StageMetrics
+from .metrics import StageMetrics, StageMetricsSnapshot
 from .pipeline import Pipeline, PipelineResult
 from .stage import StageConfig, StageFunction, stage
 
@@ -30,16 +31,18 @@ __all__ = [
     "DeadLetterCollector",
     "ErrorRouter",
     "FailedItem",
+    "Hook",
     "Pipeline",
     "PipelineResult",
     "RetryPolicy",
     "StageConfig",
     "StageFunction",
     "StageMetrics",
+    "StageMetricsSnapshot",
     "StageProcessingError",
     "batch_stage",
     "configure_logging",
     "stage",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"

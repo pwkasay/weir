@@ -17,11 +17,10 @@ Design decision: stages are functions, not classes. Why?
 import asyncio
 import functools
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any
 
 from .channel import Channel, _Sentinel
 from .errors import (
@@ -34,7 +33,7 @@ from .logging import get_logger
 from .metrics import StageMetrics
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StageConfig:
     """Configuration attached to a stage function by the @stage decorator."""
 
@@ -44,15 +43,26 @@ class StageConfig:
     retry_base_delay: float = 0.1
     retry_max_delay: float = 30.0
     retryable_errors: tuple[type[Exception], ...] = (Exception,)
+    cpu_bound: bool = False
+    _retry_policy: RetryPolicy | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_retry_policy",
+            RetryPolicy(
+                max_attempts=self.retries,
+                base_delay=self.retry_base_delay,
+                max_delay=self.retry_max_delay,
+                retryable_errors=self.retryable_errors,
+            ),
+        )
 
     @property
     def retry_policy(self) -> RetryPolicy:
-        return RetryPolicy(
-            max_attempts=self.retries,
-            base_delay=self.retry_base_delay,
-            max_delay=self.retry_max_delay,
-            retryable_errors=self.retryable_errors,
-        )
+        """Return the cached RetryPolicy for this stage's retry configuration."""
+        assert self._retry_policy is not None
+        return self._retry_policy
 
 
 class StageFunction:
@@ -65,18 +75,28 @@ class StageFunction:
 
     def __init__(
         self,
-        func: Callable[..., Awaitable[Any]],
+        func: Callable[..., Any],
         config: StageConfig,
     ) -> None:
+        """Initialize a stage function wrapper.
+
+        Args:
+            func: The function to wrap (async or sync for cpu_bound stages).
+            config: Stage configuration (concurrency, retries, timeout).
+        """
         self.func = func
         self.config = config
         self.name = func.__name__
         functools.update_wrapper(self, func)
 
     async def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Call the underlying function directly, bypassing framework machinery."""
+        if self.config.cpu_bound:
+            return self.func(*args, **kwargs)
         return await self.func(*args, **kwargs)
 
     def __repr__(self) -> str:
+        """Return a human-readable representation of the stage."""
         return f"<Stage '{self.name}' concurrency={self.config.concurrency}>"
 
 
@@ -87,8 +107,9 @@ def stage(
     retry_base_delay: float = 0.1,
     retry_max_delay: float = 30.0,
     retryable_errors: tuple[type[Exception], ...] = (Exception,),
-) -> Callable[[Callable[..., Awaitable[Any]]], StageFunction]:
-    """Decorator to declare an async function as a pipeline stage.
+    cpu_bound: bool = False,
+) -> Callable[[Callable[..., Any]], StageFunction]:
+    """Decorator to declare a function as a pipeline stage.
 
     Args:
         concurrency: Number of parallel workers for this stage.
@@ -97,14 +118,19 @@ def stage(
         retry_base_delay: Base delay for exponential backoff.
         retry_max_delay: Maximum backoff delay.
         retryable_errors: Exception types that trigger retries.
+        cpu_bound: If True, offload to a ThreadPoolExecutor. Use with sync functions.
 
     Usage:
         @stage(concurrency=5, retries=3, timeout=30)
         async def fetch(url: str) -> dict:
             ...
+
+        @stage(concurrency=4, cpu_bound=True)
+        def parse_json(raw: bytes) -> dict:
+            return json.loads(raw)
     """
 
-    def decorator(func: Callable[..., Awaitable[Any]]) -> StageFunction:
+    def decorator(func: Callable[..., Any]) -> StageFunction:
         config = StageConfig(
             concurrency=concurrency,
             retries=retries,
@@ -112,6 +138,7 @@ def stage(
             retry_base_delay=retry_base_delay,
             retry_max_delay=retry_max_delay,
             retryable_errors=retryable_errors,
+            cpu_bound=cpu_bound,
         )
         return StageFunction(func, config)
 
@@ -135,7 +162,18 @@ class StageRunner:
         output_channel: Channel[Any] | None,
         error_router: ErrorRouter,
         pipeline_name: str,
+        hooks: list[Any] | None = None,
     ) -> None:
+        """Initialize a stage runner.
+
+        Args:
+            stage_func: The decorated stage function to execute.
+            input_channel: Channel to read items from.
+            output_channel: Channel to write results to, or None for terminal stages.
+            error_router: Router for handling permanently failed items.
+            pipeline_name: Name of the owning pipeline (for logging context).
+            hooks: Optional lifecycle hooks to invoke during processing.
+        """
         self.stage_func = stage_func
         self.input_channel = input_channel
         self.output_channel = output_channel
@@ -143,22 +181,50 @@ class StageRunner:
         self.metrics = StageMetrics(stage_name=stage_func.name, _input_channel=input_channel)
         self.logger = get_logger(pipeline_name, stage_func.name)
         self._workers: list[asyncio.Task[None]] = []
+        self._executor: ThreadPoolExecutor | None = None
+        self._func: Callable[..., Any] = stage_func
+        self._record_retry = self.metrics.record_retry
+        # Pre-filter hooks by implemented methods for zero overhead when unused
+        all_hooks = hooks or []
+        self._on_start_hooks = [h for h in all_hooks if hasattr(h, "on_start")]
+        self._on_item_hooks = [h for h in all_hooks if hasattr(h, "on_item")]
+        self._on_error_hooks = [h for h in all_hooks if hasattr(h, "on_error")]
+        self._on_complete_hooks = [h for h in all_hooks if hasattr(h, "on_complete")]
+        if stage_func.config.cpu_bound:
+            self._executor = ThreadPoolExecutor(
+                max_workers=stage_func.config.concurrency,
+                thread_name_prefix=f"{stage_func.name}-cpu",
+            )
 
     @property
     def name(self) -> str:
+        """The name of the underlying stage function."""
         return self.stage_func.name
 
     @property
     def config(self) -> StageConfig:
+        """The stage's configuration (concurrency, retries, timeout)."""
         return self.stage_func.config
 
     async def start(self) -> None:
         """Launch worker tasks."""
+        if self._executor is not None:
+            loop = asyncio.get_running_loop()
+            executor = self._executor
+            raw_func = self.stage_func.func
+
+            async def _offload(item: Any) -> Any:
+                return await loop.run_in_executor(executor, raw_func, item)
+
+            self._func = _offload
+
         self.logger.info(
             "Starting stage '%s' with %d workers",
             self.name,
             self.config.concurrency,
         )
+        for hook in self._on_start_hooks:
+            await hook.on_start(self.name)
         for i in range(self.config.concurrency):
             task = asyncio.create_task(
                 self._worker_loop(worker_id=i),
@@ -170,6 +236,17 @@ class StageRunner:
         """Wait for all workers to complete (called during shutdown drain)."""
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
+        for hook in self._on_complete_hooks:
+            await hook.on_complete(self.name)
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+
+    async def cancel(self) -> None:
+        """Cancel all worker tasks and wait for them to finish."""
+        for task in self._workers:
+            if not task.done():
+                task.cancel()
+        await self.wait()
 
     async def _worker_loop(self, worker_id: int) -> None:
         """Main loop for a single worker.
@@ -193,7 +270,10 @@ class StageRunner:
             try:
                 result = await self._process_item(item)
                 duration = time.monotonic() - t0
-                await self.metrics.record_success(duration)
+                self.metrics.record_success(duration)
+
+                for hook in self._on_item_hooks:
+                    await hook.on_item(self.name, item, result, duration)
 
                 # Push to output channel (backpressure point)
                 if self.output_channel is not None and result is not None:
@@ -204,7 +284,9 @@ class StageRunner:
                 raise
             except StageProcessingError as e:
                 duration = time.monotonic() - t0
-                await self.metrics.record_error(duration)
+                self.metrics.record_error(duration)
+                for hook in self._on_error_hooks:
+                    await hook.on_error(self.name, item, e.error)
                 try:
                     await self.error_router.handle(e.to_failed_item())
                 except Exception as handler_err:
@@ -220,10 +302,10 @@ class StageRunner:
     async def _process_item(self, item: Any) -> Any:
         """Process a single item with retry and per-attempt timeout."""
         return await execute_with_retry(
-            func=self.stage_func,
+            func=self._func,
             item=item,
             stage_name=self.name,
             policy=self.config.retry_policy,
-            on_retry=self.metrics.record_retry,
+            on_retry=self._record_retry,
             timeout=self.config.timeout,
         )

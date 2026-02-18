@@ -26,7 +26,7 @@ class _Sentinel(Enum):
 STOP = _Sentinel.STOP
 
 
-@dataclass
+@dataclass(slots=True)
 class ChannelStats:
     """Observable state of a channel."""
 
@@ -37,6 +37,7 @@ class ChannelStats:
 
     @property
     def utilization(self) -> float:
+        """Channel utilization as a ratio from 0.0 (empty) to 1.0 (full)."""
         if self.capacity == 0:
             return 0.0
         return self.current_depth / self.capacity
@@ -55,6 +56,15 @@ class Channel[T]:
     """
 
     def __init__(self, capacity: int = 64, name: str | None = None) -> None:
+        """Initialize a bounded channel.
+
+        Args:
+            capacity: Maximum items buffered. Must be >= 1.
+            name: Optional name for logging and debugging.
+
+        Raises:
+            ValueError: If capacity < 1.
+        """
         if capacity < 1:
             raise ValueError(f"Channel capacity must be >= 1, got {capacity}")
         self._queue: asyncio.Queue[T | _Sentinel] = asyncio.Queue(maxsize=capacity)
@@ -66,22 +76,27 @@ class Channel[T]:
 
     @property
     def name(self) -> str:
+        """The channel's display name."""
         return self._name
 
     @property
     def depth(self) -> int:
+        """Current number of items in the channel."""
         return self._queue.qsize()
 
     @property
     def capacity(self) -> int:
+        """Maximum number of items the channel can hold."""
         return self._capacity
 
     @property
     def is_full(self) -> bool:
+        """Whether the channel is at capacity."""
         return self._queue.full()
 
     @property
     def is_empty(self) -> bool:
+        """Whether the channel has no items."""
         return self._queue.empty()
 
     async def put(self, item: T) -> None:
@@ -112,6 +127,7 @@ class Channel[T]:
         self._closed = True
 
     def stats(self) -> ChannelStats:
+        """Return a snapshot of the channel's observable state."""
         return ChannelStats(
             capacity=self._capacity,
             current_depth=self.depth,
@@ -120,10 +136,9 @@ class Channel[T]:
         )
 
     def __repr__(self) -> str:
+        """Return a human-readable representation showing depth and capacity."""
         return f"<Channel '{self._name}' {self.depth}/{self._capacity}>"
 
 
 class ChannelClosedError(Exception):
     """Raised when trying to put into a closed channel."""
-
-    pass

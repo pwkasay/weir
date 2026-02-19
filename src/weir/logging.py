@@ -86,6 +86,9 @@ class HumanFormatter(logging.Formatter):
         return line
 
 
+_logging_configured = False
+
+
 class PipelineLoggerAdapter(logging.LoggerAdapter[logging.Logger]):
     """Logger adapter that injects pipeline and stage names into every log record."""
 
@@ -102,13 +105,19 @@ class PipelineLoggerAdapter(logging.LoggerAdapter[logging.Logger]):
 def configure_logging(
     level: int = logging.INFO,
     structured: bool = False,
+    force: bool = False,
 ) -> None:
     """Configure weir logging.
 
     Args:
         level: Log level (default INFO).
         structured: If True, use JSON lines format. If False, use human-readable.
+        force: If True, reconfigure even if already configured.
     """
+    global _logging_configured
+    if _logging_configured and not force:
+        return
+
     root_logger = logging.getLogger("weir")
     root_logger.setLevel(level)
 
@@ -121,6 +130,7 @@ def configure_logging(
 
     # Don't propagate to root logger
     root_logger.propagate = False
+    _logging_configured = True
 
 
 def get_logger(pipeline_name: str, stage_name: str | None = None) -> PipelineLoggerAdapter:

@@ -15,6 +15,7 @@ The error system has three layers:
 
 import asyncio
 import logging
+import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Self
@@ -43,13 +44,53 @@ class RetryPolicy:
     retryable_errors: tuple[type[Exception], ...] = (Exception,)
 
     def delay_for_attempt(self, attempt: int) -> float:
-        """Calculate backoff delay for a given attempt number (0-indexed)."""
+        """Calculate backoff delay for a given attempt number (0-indexed).
+
+        Applies ±50% uniform jitter to the exponential delay to prevent
+        thundering herd when multiple workers retry simultaneously.
+        """
         delay = self.base_delay * (self.exponential_base**attempt)
-        return min(delay, self.max_delay)
+        jitter = delay * random.uniform(-0.5, 0.5)
+        return min(delay + jitter, self.max_delay)
 
     def is_retryable(self, error: Exception) -> bool:
         """Check whether an error should trigger a retry based on its type."""
         return isinstance(error, self.retryable_errors)
+
+
+@dataclass(frozen=True, slots=True)
+class RetryConfig:
+    """Shared retry configuration base class for stage configs.
+
+    Both StageConfig and BatchStageConfig inherit from this to avoid
+    duplicating retry-related fields and the retry_policy construction.
+    """
+
+    retries: int = 1
+    timeout: float | None = None
+    retry_base_delay: float = 0.1
+    retry_max_delay: float = 30.0
+    retryable_errors: tuple[type[Exception], ...] = (Exception,)
+    cpu_bound: bool = False
+    _retry_policy: RetryPolicy | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_retry_policy",
+            RetryPolicy(
+                max_attempts=self.retries,
+                base_delay=self.retry_base_delay,
+                max_delay=self.retry_max_delay,
+                retryable_errors=self.retryable_errors,
+            ),
+        )
+
+    @property
+    def retry_policy(self) -> RetryPolicy:
+        """Return the cached RetryPolicy for this config's retry settings."""
+        assert self._retry_policy is not None
+        return self._retry_policy
 
 
 @dataclass(slots=True)
@@ -200,24 +241,6 @@ async def execute_with_retry(
     Timeout is applied per-attempt, not across the entire retry loop.
     TimeoutError is always treated as retryable.
     """
-    # Fast path: no retries configured (the common case)
-    if policy.max_attempts == 1:
-        try:
-            if timeout is not None:
-                async with asyncio.timeout(timeout):
-                    return await func(item)
-            else:
-                return await func(item)
-        except Exception as e:
-            raise StageProcessingError(
-                item=item,
-                stage_name=stage_name,
-                error=e,
-                attempts=1,
-                error_chain=[e],
-            ) from e
-
-    # Slow path: retry loop
     error_chain: list[Exception] | None = None
 
     for attempt in range(policy.max_attempts):
@@ -227,40 +250,13 @@ async def execute_with_retry(
                     return await func(item)
             else:
                 return await func(item)
-        except TimeoutError as e:
-            if error_chain is None:
-                error_chain = []
-            error_chain.append(e)
-
-            is_last_attempt = attempt == policy.max_attempts - 1
-
-            if is_last_attempt:
-                raise StageProcessingError(
-                    item=item,
-                    stage_name=stage_name,
-                    error=e,
-                    attempts=attempt + 1,
-                    error_chain=error_chain,
-                ) from e
-
-            delay = policy.delay_for_attempt(attempt)
-            logger.debug(
-                "Stage '%s' attempt %d/%d timed out, retrying in %.2fs",
-                stage_name,
-                attempt + 1,
-                policy.max_attempts,
-                delay,
-            )
-            if on_retry:
-                on_retry()
-            await asyncio.sleep(delay)
         except Exception as e:
             if error_chain is None:
                 error_chain = []
             error_chain.append(e)
 
             is_last_attempt = attempt == policy.max_attempts - 1
-            is_retryable = policy.is_retryable(e)
+            is_retryable = isinstance(e, TimeoutError) or policy.is_retryable(e)
 
             if is_last_attempt or not is_retryable:
                 raise StageProcessingError(
@@ -271,7 +267,6 @@ async def execute_with_retry(
                     error_chain=error_chain,
                 ) from e
 
-            # Retry
             delay = policy.delay_for_attempt(attempt)
             logger.debug(
                 "Stage '%s' attempt %d/%d failed (%s), retrying in %.2fs",

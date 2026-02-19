@@ -78,6 +78,11 @@ class StageMetrics:
 
     These are collected automatically by the stage runner. You never
     need to touch them directly unless you're building a dashboard.
+
+    Thread safety: StageMetrics is *not* thread-safe by itself. It relies on
+    the single event loop execution model — all record_*() calls happen from
+    asyncio tasks on the same thread, so no locking is needed. Do not call
+    mutating methods from outside the event loop thread.
     """
 
     stage_name: str

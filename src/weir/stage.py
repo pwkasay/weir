@@ -18,51 +18,23 @@ import asyncio
 import functools
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from .channel import Channel, _Sentinel
+from .channel import is_stop_signal
 from .errors import (
-    ErrorRouter,
-    RetryPolicy,
+    RetryConfig,
     StageProcessingError,
     execute_with_retry,
 )
-from .logging import get_logger
-from .metrics import StageMetrics
+from .runner import BaseStageRunner
 
 
 @dataclass(frozen=True, slots=True)
-class StageConfig:
+class StageConfig(RetryConfig):
     """Configuration attached to a stage function by the @stage decorator."""
 
     concurrency: int = 1
-    retries: int = 1
-    timeout: float | None = None
-    retry_base_delay: float = 0.1
-    retry_max_delay: float = 30.0
-    retryable_errors: tuple[type[Exception], ...] = (Exception,)
-    cpu_bound: bool = False
-    _retry_policy: RetryPolicy | None = field(default=None, init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "_retry_policy",
-            RetryPolicy(
-                max_attempts=self.retries,
-                base_delay=self.retry_base_delay,
-                max_delay=self.retry_max_delay,
-                retryable_errors=self.retryable_errors,
-            ),
-        )
-
-    @property
-    def retry_policy(self) -> RetryPolicy:
-        """Return the cached RetryPolicy for this stage's retry configuration."""
-        assert self._retry_policy is not None
-        return self._retry_policy
 
 
 class StageFunction:
@@ -145,7 +117,7 @@ def stage(
     return decorator
 
 
-class StageRunner:
+class StageRunner(BaseStageRunner):
     """Runs a stage function with its full machinery.
 
     This is the internal runtime representation of a stage within a pipeline.
@@ -154,99 +126,6 @@ class StageRunner:
 
     Users don't create StageRunners directly — the Pipeline builds them.
     """
-
-    def __init__(
-        self,
-        stage_func: StageFunction,
-        input_channel: Channel[Any],
-        output_channel: Channel[Any] | None,
-        error_router: ErrorRouter,
-        pipeline_name: str,
-        hooks: list[Any] | None = None,
-    ) -> None:
-        """Initialize a stage runner.
-
-        Args:
-            stage_func: The decorated stage function to execute.
-            input_channel: Channel to read items from.
-            output_channel: Channel to write results to, or None for terminal stages.
-            error_router: Router for handling permanently failed items.
-            pipeline_name: Name of the owning pipeline (for logging context).
-            hooks: Optional lifecycle hooks to invoke during processing.
-        """
-        self.stage_func = stage_func
-        self.input_channel = input_channel
-        self.output_channel = output_channel
-        self.error_router = error_router
-        self.metrics = StageMetrics(stage_name=stage_func.name, _input_channel=input_channel)
-        self.logger = get_logger(pipeline_name, stage_func.name)
-        self._workers: list[asyncio.Task[None]] = []
-        self._executor: ThreadPoolExecutor | None = None
-        self._func: Callable[..., Any] = stage_func
-        self._record_retry = self.metrics.record_retry
-        # Pre-filter hooks by implemented methods for zero overhead when unused
-        all_hooks = hooks or []
-        self._on_start_hooks = [h for h in all_hooks if hasattr(h, "on_start")]
-        self._on_item_hooks = [h for h in all_hooks if hasattr(h, "on_item")]
-        self._on_error_hooks = [h for h in all_hooks if hasattr(h, "on_error")]
-        self._on_complete_hooks = [h for h in all_hooks if hasattr(h, "on_complete")]
-        if stage_func.config.cpu_bound:
-            self._executor = ThreadPoolExecutor(
-                max_workers=stage_func.config.concurrency,
-                thread_name_prefix=f"{stage_func.name}-cpu",
-            )
-
-    @property
-    def name(self) -> str:
-        """The name of the underlying stage function."""
-        return self.stage_func.name
-
-    @property
-    def config(self) -> StageConfig:
-        """The stage's configuration (concurrency, retries, timeout)."""
-        return self.stage_func.config
-
-    async def start(self) -> None:
-        """Launch worker tasks."""
-        if self._executor is not None:
-            loop = asyncio.get_running_loop()
-            executor = self._executor
-            raw_func = self.stage_func.func
-
-            async def _offload(item: Any) -> Any:
-                return await loop.run_in_executor(executor, raw_func, item)
-
-            self._func = _offload
-
-        self.logger.info(
-            "Starting stage '%s' with %d workers",
-            self.name,
-            self.config.concurrency,
-        )
-        for hook in self._on_start_hooks:
-            await hook.on_start(self.name)
-        for i in range(self.config.concurrency):
-            task = asyncio.create_task(
-                self._worker_loop(worker_id=i),
-                name=f"{self.name}-worker-{i}",
-            )
-            self._workers.append(task)
-
-    async def wait(self) -> None:
-        """Wait for all workers to complete (called during shutdown drain)."""
-        if self._workers:
-            await asyncio.gather(*self._workers, return_exceptions=True)
-        for hook in self._on_complete_hooks:
-            await hook.on_complete(self.name)
-        if self._executor is not None:
-            self._executor.shutdown(wait=False)
-
-    async def cancel(self) -> None:
-        """Cancel all worker tasks and wait for them to finish."""
-        for task in self._workers:
-            if not task.done():
-                task.cancel()
-        await self.wait()
 
     async def _worker_loop(self, worker_id: int) -> None:
         """Main loop for a single worker.
@@ -261,7 +140,7 @@ class StageRunner:
             item = await self.input_channel.get()
 
             # Check for shutdown sentinel
-            if isinstance(item, _Sentinel):
+            if is_stop_signal(item):
                 self.logger.debug("Worker %d received STOP", worker_id)
                 break
 

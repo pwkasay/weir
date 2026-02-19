@@ -36,8 +36,10 @@ from typing import Any, Self
 from .batch import BatchStageFunction, BatchStageRunner
 from .channel import Channel
 from .errors import DeadLetterCollector, ErrorHandler, ErrorRouter
+from .hooks import Hook
 from .logging import PipelineLoggerAdapter, configure_logging, get_logger
 from .metrics import StageMetricsSnapshot
+from .runner import BaseStageRunner
 from .shutdown import ShutdownCoordinator
 from .stage import StageFunction, StageRunner
 
@@ -135,13 +137,13 @@ class Pipeline:
         self._stages: list[StageFunction | BatchStageFunction] = []
         self._error_router = ErrorRouter()
         self._dead_letters = DeadLetterCollector()
-        self._hooks: list[Any] = []
+        self._hooks: list[Hook] = []
         self._metrics_callback: Callable[..., Any] | None = None
         self._metrics_interval: float = 5.0
         self._built = False
 
         # Runtime state (populated by build)
-        self._runners: list[StageRunner | BatchStageRunner] = []
+        self._runners: list[BaseStageRunner] = []
         self._channels: list[Channel[Any]] = []
         self._coordinator: ShutdownCoordinator | None = None
 
@@ -190,7 +192,7 @@ class Pipeline:
         self._error_router.on(error_type, handler or self._dead_letters)
         return self
 
-    def with_hook(self, hook: Any) -> Self:
+    def with_hook(self, hook: Hook) -> Self:
         """Register a lifecycle hook for all stages.
 
         Hooks receive callbacks at stage lifecycle points (start, item, error, complete).
@@ -233,6 +235,9 @@ class Pipeline:
         # Set default error handler to dead letter collector
         self._error_router.set_default(self._dead_letters)
 
+        # Configure logging once at build time (idempotent — won't clobber user config)
+        configure_logging(level=self._log_level, structured=self._structured_logging)
+
         self._wire_topology()
         self._built = True
         return self
@@ -274,7 +279,7 @@ class Pipeline:
 
             hooks = self._hooks if self._hooks else None
             if isinstance(stage_func, BatchStageFunction):
-                runner: StageRunner | BatchStageRunner = BatchStageRunner(
+                runner: BaseStageRunner = BatchStageRunner(
                     stage_func=stage_func,
                     input_channel=input_ch,
                     output_channel=output_ch,
@@ -305,8 +310,6 @@ class Pipeline:
 
         assert self._coordinator is not None
 
-        # Configure logging
-        configure_logging(level=self._log_level, structured=self._structured_logging)
         log = get_logger(self._name)
 
         log.info("Pipeline '%s' starting (%d stages)", self._name, len(self._runners))

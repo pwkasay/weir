@@ -17,12 +17,15 @@ What we don't care about:
 """
 
 import asyncio
+import json
+import logging
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
 from weir import (
+    ChannelClosedError,
     DeadLetterCollector,
     Pipeline,
     StageMetrics,
@@ -37,6 +40,7 @@ from weir.errors import (
     StageProcessingError,
     execute_with_retry,
 )
+from weir.logging import StructuredFormatter
 from weir.metrics import LatencyHistogram
 
 # ── Channel Tests ──
@@ -1486,3 +1490,178 @@ class TestPipelineReset:
         r2 = await pipe.run()
         # Should be 5, not 15
         assert r2.stage_metrics[0]["items_in"] == 5
+
+
+# ── Additional Coverage Tests ──
+
+
+class TestConcurrencyStress:
+    """High-item-count stress test with many concurrent workers."""
+
+    async def test_1000_items_8_workers(self):
+        """1000 items through an 8-worker stage — all items processed, none lost."""
+        results: list[int] = []
+
+        @stage(concurrency=8)
+        async def process(x: int) -> int:
+            await asyncio.sleep(0.001)
+            return x * 2
+
+        @stage(concurrency=1)
+        async def collect(x: int) -> None:
+            results.append(x)
+
+        pipe = (
+            Pipeline("stress-test", channel_capacity=32)
+            .source(range(1000))
+            .then(process)
+            .then(collect)
+            .build()
+        )
+
+        result = await pipe.run()
+        assert result.completed
+        assert sorted(results) == [x * 2 for x in range(1000)]
+
+
+class TestAsyncCallableSource:
+    """Callable that returns an async generator as a pipeline source."""
+
+    async def test_async_callable_source(self):
+        results: list[int] = []
+
+        def make_async_source():
+            async def _gen():
+                for i in range(5):
+                    yield i
+
+            return _gen()
+
+        @stage(concurrency=1)
+        async def collect(x: int) -> None:
+            results.append(x)
+
+        pipe = (
+            Pipeline("test-async-callable-source", channel_capacity=10)
+            .source(make_async_source)
+            .then(collect)
+            .build()
+        )
+
+        result = await pipe.run()
+        assert result.completed
+        assert sorted(results) == [0, 1, 2, 3, 4]
+
+
+class TestErrorRouterMROBothHandlers:
+    """ErrorRouter with handlers for both parent and child exception types."""
+
+    async def test_child_handler_takes_priority(self):
+        """ConnectionError handler wins over OSError handler for ConnectionError."""
+        os_handled: list[FailedItem] = []
+        conn_handled: list[FailedItem] = []
+
+        async def os_handler(failed: FailedItem) -> None:
+            os_handled.append(failed)
+
+        async def conn_handler(failed: FailedItem) -> None:
+            conn_handled.append(failed)
+
+        router = ErrorRouter()
+        router.on(OSError, os_handler)
+        router.on(ConnectionError, conn_handler)
+
+        # ConnectionError should go to conn_handler (exact match)
+        conn_failed = FailedItem(item="a", stage_name="s", error=ConnectionError("net"), attempts=1)
+        await router.handle(conn_failed)
+        assert len(conn_handled) == 1
+        assert len(os_handled) == 0
+
+        # OSError should go to os_handler
+        os_failed = FailedItem(item="b", stage_name="s", error=OSError("disk"), attempts=1)
+        await router.handle(os_failed)
+        assert len(os_handled) == 1
+        assert len(conn_handled) == 1  # unchanged
+
+
+class TestStructuredFormatter:
+    """StructuredFormatter produces valid JSON with required fields."""
+
+    def test_json_output_format(self):
+        formatter = StructuredFormatter()
+        record = logging.LogRecord(
+            name="weir.pipeline.test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="Test message",
+            args=(),
+            exc_info=None,
+        )
+        output = formatter.format(record)
+        parsed = json.loads(output)
+
+        assert parsed["level"] == "info"
+        assert parsed["msg"] == "Test message"
+        assert parsed["logger"] == "weir.pipeline.test"
+        assert "ts" in parsed
+
+    def test_pipeline_stage_context_injected(self):
+        formatter = StructuredFormatter()
+        record = logging.LogRecord(
+            name="weir.pipeline.my-pipe",
+            level=logging.WARNING,
+            pathname="",
+            lineno=0,
+            msg="Something happened",
+            args=(),
+            exc_info=None,
+        )
+        record.pipeline = "my-pipe"  # type: ignore[attr-defined]
+        record.stage = "fetch"  # type: ignore[attr-defined]
+
+        output = formatter.format(record)
+        parsed = json.loads(output)
+
+        assert parsed["pipeline"] == "my-pipe"
+        assert parsed["stage"] == "fetch"
+
+
+class TestChannelClosedError:
+    """put() after send_stop() raises ChannelClosedError."""
+
+    async def test_put_after_close_raises(self):
+        ch = Channel(capacity=10, name="test-closed")
+        await ch.send_stop(num_consumers=1)
+
+        with pytest.raises(ChannelClosedError):
+            await ch.put("should fail")
+
+
+class TestBatchRetry:
+    """Batch stage retries transient failures and succeeds."""
+
+    async def test_batch_retry_then_succeed(self):
+        attempt_count = 0
+        received_batches: list[list[int]] = []
+
+        @batch_stage(batch_size=3, flush_timeout=5.0, retries=3, retry_base_delay=0.01)
+        async def flaky_batch(items: list[int]) -> None:
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                raise ConnectionError("transient batch failure")
+            received_batches.append(list(items))
+
+        pipe = (
+            Pipeline("test-batch-retry", channel_capacity=10)
+            .source([1, 2, 3])
+            .then(flaky_batch)
+            .build()
+        )
+
+        result = await pipe.run()
+        assert result.completed
+        all_items = sorted([x for batch in received_batches for x in batch])
+        assert all_items == [1, 2, 3]
+        assert attempt_count >= 2  # At least one retry

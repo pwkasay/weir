@@ -26,6 +26,11 @@ class _Sentinel(Enum):
 STOP = _Sentinel.STOP
 
 
+def is_stop_signal(item: object) -> bool:
+    """Check whether an item is the shutdown sentinel."""
+    return isinstance(item, _Sentinel)
+
+
 @dataclass(slots=True)
 class ChannelStats:
     """Observable state of a channel."""

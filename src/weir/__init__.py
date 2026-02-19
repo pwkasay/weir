@@ -9,11 +9,12 @@ if you need it, but you probably don't.
 """
 
 from .batch import BatchStageConfig, BatchStageFunction, batch_stage
-from .channel import Channel, ChannelClosedError
+from .channel import Channel, ChannelClosedError, is_stop_signal
 from .errors import (
     DeadLetterCollector,
     ErrorRouter,
     FailedItem,
+    RetryConfig,
     RetryPolicy,
     StageProcessingError,
 )
@@ -21,9 +22,11 @@ from .hooks import Hook
 from .logging import configure_logging
 from .metrics import StageMetrics, StageMetricsSnapshot
 from .pipeline import Pipeline, PipelineResult
+from .runner import BaseStageRunner
 from .stage import StageConfig, StageFunction, stage
 
 __all__ = [
+    "BaseStageRunner",
     "BatchStageConfig",
     "BatchStageFunction",
     "Channel",
@@ -34,6 +37,7 @@ __all__ = [
     "Hook",
     "Pipeline",
     "PipelineResult",
+    "RetryConfig",
     "RetryPolicy",
     "StageConfig",
     "StageFunction",
@@ -42,6 +46,7 @@ __all__ = [
     "StageProcessingError",
     "batch_stage",
     "configure_logging",
+    "is_stop_signal",
     "stage",
 ]
 

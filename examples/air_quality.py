@@ -17,10 +17,9 @@ import asyncio
 import logging
 import random
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from weir import DeadLetterCollector, Pipeline, stage
-
 
 # ── Domain Models ──
 
@@ -90,7 +89,7 @@ async def fetch_reading(station: StationConfig) -> RawReading:
         pm25=random.uniform(-5, 300),   # Intentionally can be negative (bad sensor)
         pm10=random.uniform(0, 500),
         ozone=random.uniform(0, 200),
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
     )
 
 

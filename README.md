@@ -154,7 +154,7 @@ pip install weir-pipeline
 
 ```bash
 # From git (latest)
-pip install git+https://github.com/paulkasay/weir.git
+pip install git+https://github.com/pwkasay/weir.git
 
 # Local development
 pip install -e ".[dev]"

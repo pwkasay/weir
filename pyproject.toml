@@ -36,8 +36,8 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/paulkasay/weir"
-Issues = "https://github.com/paulkasay/weir/issues"
+Repository = "https://github.com/pwkasay/weir"
+Issues = "https://github.com/pwkasay/weir/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/weir"]

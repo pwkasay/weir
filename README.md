@@ -63,15 +63,18 @@ observability, error routing, graceful shutdown — falls out of taking that ass
 ### Core Abstractions
 
 - **`Stage`**: A decorated async function with concurrency, retry, and timeout policy.
-  The atomic unit of work.
+  The atomic unit of work. Configuration inherits from `RetryConfig`.
 - **`BatchStage`**: A decorated async function that processes items in groups. Accumulates
   items until `batch_size` is reached or `flush_timeout` expires, then flushes.
+- **`BaseStageRunner`**: Abstract base class providing shared lifecycle management
+  (`start`, `wait`, `cancel`) for both `StageRunner` and `BatchStageRunner`.
 - **`Channel`**: A bounded async queue connecting two stages. The backpressure mechanism.
-  Configurable capacity and overflow strategy.
+  Configurable capacity. Use `is_stop_signal()` to check for shutdown sentinels.
 - **`Pipeline`**: A composed sequence of stages and channels. Owns the lifecycle:
-  startup, run, drain, shutdown.
+  startup, run, drain, shutdown. Hooks are typed via the `Hook` protocol.
 - **`StageMetrics`**: Per-stage counters and histograms. Emitted automatically.
 - **`ErrorRouter`**: Maps exception types to handlers (retry, dead-letter).
+- **`RetryPolicy`**: Exponential backoff with ±50% jitter to prevent thundering herd.
 
 ### Data Flow
 
@@ -160,11 +163,13 @@ src/weir/
 ├── __init__.py          # Public API surface
 ├── stage.py             # @stage decorator and StageRunner
 ├── batch.py             # @batch_stage decorator and BatchStageRunner
+├── runner.py            # BaseStageRunner ABC (shared lifecycle logic)
 ├── channel.py           # Bounded async channel with backpressure
 ├── pipeline.py          # Pipeline builder and runtime
 ├── metrics.py           # Per-stage metrics collection
-├── errors.py            # Error routing and retry logic
+├── errors.py            # Error routing, retry logic, and RetryConfig base class
 ├── shutdown.py          # Graceful shutdown coordination
+├── hooks.py             # Hook protocol for lifecycle extensibility
 └── logging.py           # Structured logging setup
 ```
 

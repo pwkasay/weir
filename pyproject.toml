@@ -3,7 +3,7 @@ requires = ["hatchling", "editables"]
 build-backend = "hatchling.build"
 
 [project]
-name = "weir"
+name = "weir-pipeline"
 version = "0.4.0"
 description = "Lightweight, opinionated async data pipeline framework"
 readme = "README.md"
@@ -21,6 +21,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Typing :: Typed",
 ]
+keywords = ["async", "pipeline", "asyncio", "data-pipeline", "backpressure", "etl"]
 dependencies = []
 
 [project.optional-dependencies]
@@ -30,10 +31,13 @@ dev = [
     "pytest-timeout>=2.0",
     "ruff>=0.1",
     "mypy>=1.0",
+    "build>=1.0",
+    "twine>=6.0",
 ]
 
 [project.urls]
 Repository = "https://github.com/paulkasay/weir"
+Issues = "https://github.com/paulkasay/weir/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/weir"]

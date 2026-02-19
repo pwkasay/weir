@@ -149,12 +149,21 @@ expires, whichever comes first. On shutdown, any remaining items are flushed as 
 ## Installation
 
 ```bash
-# From git
+pip install weir-pipeline
+```
+
+```bash
+# From git (latest)
 pip install git+https://github.com/paulkasay/weir.git
 
 # Local development
 pip install -e ".[dev]"
 ```
+
+> **Note:** The PyPI package is `weir-pipeline`, but the import is just `weir`:
+> ```python
+> from weir import Pipeline, stage
+> ```
 
 ## Project Structure
 
